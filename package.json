@@ -1,36 +1,27 @@
 {
-  "name": "solana-sniper-bot",
+  "name": "solena-pumpfun-bot",
   "version": "1.0.0",
-  "description": "Automated Solana trading bot with security checks, liquidity watcher, and auto-sell.",
-  "main": "index.js",
+  "description": "Pump.fun trading bot with Solana + BSC wallet utilities",
   "type": "module",
+  "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js",
-    "lint": "eslint .",
-    "test": "echo \"No tests yet\""
+    "buy": "node buyCaller_pumpfun.js",
+    "sell": "node sellCaller_pumpfun.js",
+    "balance": "node walletbalance.js",
+    "withdraw-bnb": "node withdraw.js",
+    "withdraw-sol": "node withdraw_sol.js",
+    "check-wallet": "node check_wallet.js"
   },
-  "keywords": [
-    "solana",
-    "trading",
-    "bot",
-    "jupiter",
-    "liquidity",
-    "auto-sell",
-    "security"
-  ],
-  "author": "Your Name",
-  "license": "MIT",
   "dependencies": {
-    "@solana/web3.js": "^1.98.4",
+    "@solana/web3.js": "^1.98.0",
     "bs58": "^5.0.0",
-    "crypto": "^1.0.1",
-    "dotenv": "^16.3.1",
-    "node-fetch": "^3.3.2",
-    "p-queue": "^7.3.0"
+    "crypto-js": "^4.2.0",
+    "dotenv": "^17.2.3",
+    "ethers": "^6.16.0",
+    "p-queue": "^8.0.1"
   },
-  "devDependencies": {
-    "nodemon": "^3.0.2",
-    "eslint": "^8.46.0"
+  "engines": {
+    "node": ">=18"
   }
 }
