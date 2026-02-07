@@ -1,0 +1,382 @@
+import "dotenv/config";
+import fs from "fs";
+import path from "path";
+import { Connection, PublicKey } from "@solana/web3.js";
+import { TOKEN_PROGRAM_ID, TOKEN_2022_PROGRAM_ID } from "@solana/spl-token";
+import PQueue from "p-queue";
+import { getCanonicalMint } from "./canonical_mint.js";
+
+// ---------------- RPC FAILOVER ----------------
+const RPC_ENDPOINTS = [process.env.RPC_URL_11, process.env.RPC_URL_12].filter(Boolean);
+if (!RPC_ENDPOINTS.length) throw new Error("No RPC endpoints found. Set RPC_URL_11/RPC_URL_12");
+
+const COMMITMENT = "confirmed";
+const CONNECTIONS = RPC_ENDPOINTS.map((url) => new Connection(url, { commitment: COMMITMENT }));
+let rpcIndex = 0;
+
+function isRateLimitError(e) {
+  const msg = String(e?.message || e || "").toLowerCase();
+  return (
+    msg.includes("429") ||
+    msg.includes("too many requests") ||
+    msg.includes("rate limit") ||
+    msg.includes("timed out") ||
+    msg.includes("timeout") ||
+    msg.includes("fetch failed") ||
+    msg.includes("node is behind") ||
+    msg.includes("overloaded") ||
+    msg.includes("service unavailable")
+  );
+}
+
+const q = new PQueue({
+  intervalCap: Number(process.env.RPC_INTERVAL_CAP || 12),
+  interval: Number(process.env.RPC_INTERVAL_MS || 1000),
+  carryoverConcurrencyCount: true,
+});
+
+async function withRpcFailover(opName, fn) {
+  const attempts = CONNECTIONS.length;
+  let lastErr = null;
+
+  for (let i = 0; i < attempts; i++) {
+    const idx = (rpcIndex + i) % CONNECTIONS.length;
+    const c = CONNECTIONS[idx];
+
+    try {
+      const res = await fn(c);
+      rpcIndex = idx;
+      return res;
+    } catch (e) {
+      lastErr = e;
+
+      // retry next RPC on rate limit / flaky RPC errors
+      if (isRateLimitError(e)) continue;
+
+      // still try next RPC (your previous behavior)
+      continue;
+    }
+  }
+
+  throw new Error(`[RPC_FAILOVER:${opName}] ${String(lastErr?.message || lastErr)}`);
+}
+
+const rpcLimited = (opName, fn) => q.add(() => withRpcFailover(opName, fn));
+
+// ---------------- Pump.fun program ----------------
+const PUMP_PROGRAM_ID = new PublicKey("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P");
+
+// ---------------- Blacklist config ----------------
+const BLACKLIST_FILE = path.resolve(process.cwd(), "blacklist.json");
+const MIN_CREATOR_SCORE = 65;
+const AUTO_BLACKLIST_THRESHOLD = 30;
+const CREATOR_UNKNOWN_PENALTY = Number(process.env.CREATOR_UNKNOWN_PENALTY || 25);
+
+// ---------------- Dev thresholds ----------------
+const DEV_MIN_AGE_DAYS = Number(process.env.DEV_MIN_AGE_DAYS || 7);
+const DEV_MIN_TXS = Number(process.env.DEV_MIN_TXS || 5);
+
+// ---------------- File helpers ----------------
+function loadBlacklist() {
+  try {
+    const j = JSON.parse(fs.readFileSync(BLACKLIST_FILE, "utf8"));
+    const wallets = Array.isArray(j?.wallets) ? j.wallets : [];
+    return new Set(wallets);
+  } catch {
+    return new Set();
+  }
+}
+
+function saveBlacklist(set) {
+  fs.writeFileSync(BLACKLIST_FILE, JSON.stringify({ wallets: [...set] }, null, 2));
+}
+
+// ---------------- Token program detection ----------------
+async function detectTokenProgramOwner(mintPub) {
+  const acc = await rpcLimited("getAccountInfo(mint)", (c) => c.getAccountInfo(mintPub)).catch(() => null);
+  const owner = acc?.owner?.toBase58?.() || null;
+
+  if (!owner) return { ok: false, owner: null, isToken2022: false, isTokenProgram: false };
+
+  const isToken2022 = owner === TOKEN_2022_PROGRAM_ID.toBase58();
+  const isTokenProgram = owner === TOKEN_PROGRAM_ID.toBase58();
+
+  return { ok: true, owner, isToken2022, isTokenProgram };
+}
+
+// ---------------- FAST creator derivation ----------------
+// Key change: returns sawPump always, so you can decide "pump token" vs "non-pump token".
+async function derivePumpfunCreatorFast(mintPub) {
+  const sigInfos = await rpcLimited("getSignaturesForAddress(mint)", (c) =>
+    c.getSignaturesForAddress(mintPub, { limit: 25 })
+  ).catch(() => []);
+
+  if (!sigInfos.length) return { creator: null, signature: null, scanned: 0, sawPump: false };
+
+  let scanned = 0;
+  let sawPump = false;
+
+  const pump = PUMP_PROGRAM_ID.toBase58();
+
+  function keyToB58(k) {
+    try {
+      return k?.toBase58 ? k.toBase58() : String(k);
+    } catch {
+      return "";
+    }
+  }
+
+  function extractKeys(tx) {
+    const msg = tx?.transaction?.message;
+    if (!msg) return [];
+
+    // Legacy tx
+    if (Array.isArray(msg.accountKeys) && msg.accountKeys.length) {
+      return msg.accountKeys.map(keyToB58).filter(Boolean);
+    }
+
+    // Versioned tx (v0)
+    const staticKeys = Array.isArray(msg.staticAccountKeys) ? msg.staticAccountKeys : [];
+    const loaded = tx?.meta?.loadedAddresses || {};
+    const writable = Array.isArray(loaded.writable) ? loaded.writable : [];
+    const readonly = Array.isArray(loaded.readonly) ? loaded.readonly : [];
+
+    return [...staticKeys, ...writable, ...readonly].map(keyToB58).filter(Boolean);
+  }
+
+  function extractInstructions(msg) {
+    // Legacy uses `instructions`, v0 often uses `compiledInstructions`
+    if (Array.isArray(msg?.instructions)) return msg.instructions;
+    if (Array.isArray(msg?.compiledInstructions)) return msg.compiledInstructions;
+    return [];
+  }
+
+  for (const s of sigInfos) {
+    const sig = s?.signature;
+    if (!sig) continue;
+    scanned++;
+
+    const tx = await rpcLimited("getTransaction(sig)", (c) =>
+      c.getTransaction(sig, { commitment: COMMITMENT, maxSupportedTransactionVersion: 1 })
+    ).catch(() => null);
+
+    const msg = tx?.transaction?.message;
+    if (!msg) continue;
+
+    const keys = extractKeys(tx);
+    if (!keys.length) continue;
+
+    const ix = extractInstructions(msg);
+
+    // programIdIndex exists on both legacy & compiled instructions
+    const touchesPump = ix.some((i) => {
+      const idx = i?.programIdIndex;
+      return typeof idx === "number" && keys[idx] === pump;
+    });
+
+    if (!touchesPump) continue;
+
+    sawPump = true;
+
+    // Fee payer best-effort:
+    // Legacy: keys[0] is payer
+    // v0: still usually staticAccountKeys[0], which ends up as keys[0] here
+    const payer = keys[0] || null;
+
+    return { creator: payer, signature: sig, scanned, sawPump: true };
+  }
+
+  return { creator: null, signature: null, scanned, sawPump };
+}
+// ---------------- Creator wallet analysis ----------------
+async function analyzeCreatorWallet(creatorAddress) {
+  const reasons = [];
+  let score = 100;
+
+  let creatorPub;
+  try {
+    creatorPub = new PublicKey(creatorAddress);
+  } catch {
+    return { safe: false, score: 0, reasons: ["Invalid creator pubkey"], details: {} };
+  }
+
+  const sigInfos = await rpcLimited("getSignaturesForAddress(creator)", (c) =>
+    c.getSignaturesForAddress(creatorPub, { limit: 300 })
+  ).catch(() => []);
+
+  if (!sigInfos.length) {
+    return { safe: false, score: 0, reasons: ["Creator has no on-chain history"], details: { txCount: 0 } };
+  }
+
+  const earliest = sigInfos[sigInfos.length - 1];
+  const earliestBlockTime = typeof earliest?.blockTime === "number" ? earliest.blockTime : null;
+
+  const now = Math.floor(Date.now() / 1000);
+  const ageDays = earliestBlockTime ? (now - earliestBlockTime) / 86400 : 0;
+  const txCount = sigInfos.length;
+
+  if (!earliestBlockTime || ageDays < DEV_MIN_AGE_DAYS) {
+    score -= 80;
+    reasons.push(`Creator wallet too new (${ageDays.toFixed(1)}d)`);
+  } else {
+    reasons.push(`Creator wallet age ${ageDays.toFixed(1)}d`);
+  }
+
+  if (txCount < DEV_MIN_TXS) {
+    score -= 30;
+    reasons.push(`Creator tx count low (${txCount})`);
+  } else {
+    reasons.push(`Creator tx count ${txCount}`);
+  }
+
+  const bal = await rpcLimited("getBalance(creator)", (c) => c.getBalance(creatorPub)).catch(() => null);
+  if (typeof bal === "number") {
+    const sol = bal / 1e9;
+    if (sol < 0.05) {
+      score -= 10;
+      reasons.push(`Creator SOL balance low (${sol.toFixed(4)})`);
+    } else {
+      reasons.push(`Creator SOL balance ${sol.toFixed(4)}`);
+    }
+  }
+
+  score = Math.max(0, Math.min(100, score));
+  return { safe: score >= MIN_CREATOR_SCORE, score, reasons, details: { ageDays, txCount } };
+}
+
+// ---------------- Exported API ----------------
+export async function verifyCreatorSafetyPumpfun(mintOrRecord) {
+  const reasons = [];
+  let score = 100;
+
+  // 1) Canonical mint gateway (handles ...pump, token account, bonding curve, etc)
+  const canon = await getCanonicalMint(mintOrRecord, "confirmed");
+
+  if (!canon?.ok || !canon.mint) {
+    return {
+      safe: false,
+      score: 0,
+      reasons: ["Unresolved mint identifier"],
+      creator: null,
+      details: {
+        input: mintOrRecord,
+        resolver: canon?.resolver || null,
+        error: canon?.error || null,
+      },
+    };
+  }
+
+  const mintStr = String(canon.mint).trim();
+
+  // 2) Convert canonical mint string -> PublicKey
+  let mintPub;
+  try {
+    mintPub = new PublicKey(mintStr);
+  } catch {
+    return {
+      safe: false,
+      score: 0,
+      reasons: ["Invalid canonical mint"],
+      creator: null,
+      details: {
+        input: mintOrRecord,
+        mint: mintStr,
+        resolver: canon?.resolver || null,
+      },
+    };
+  }
+
+  // 3) Token program owner check (on-chain)
+  const prog = await detectTokenProgramOwner(mintPub);
+
+  if (!prog.ok) {
+    reasons.push("mint_account_owner_unknown");
+    score -= 15;
+  } else if (prog.isToken2022) {
+    score -= 25;
+    reasons.push("token2022_detected_penalty");
+  } else if (prog.isTokenProgram) {
+    reasons.push("spl_token_program_ok");
+  } else {
+    return {
+      safe: false,
+      score: 0,
+      reasons: [`Unknown token program owner: ${prog.owner || "null"}`],
+      creator: null,
+      details: {
+        mint: mintStr,
+        tokenProgram: prog,
+        resolver: canon?.resolver || null,
+      },
+    };
+  }
+
+  // 4) Derive creator (Pump-only)
+  const derived = await derivePumpfunCreatorFast(mintPub);
+
+  if (!derived.creator) {
+    if (derived.sawPump) {
+      score = Math.max(0, score - CREATOR_UNKNOWN_PENALTY);
+      reasons.push("pump_creator_unknown");
+    } else {
+      reasons.push("non_pump_token_skip_creator_checks");
+    }
+
+    score = Math.max(0, Math.min(100, score));
+
+    return {
+      safe: score >= MIN_CREATOR_SCORE,
+      score,
+      reasons,
+      creator: null,
+      details: {
+        mint: mintStr,
+        resolver: canon?.resolver || null,
+        derived,
+        tokenProgram: prog,
+      },
+    };
+  }
+
+  // 5) Blacklist (only if creator exists)
+  const blacklist = loadBlacklist();
+  if (blacklist.has(derived.creator)) {
+    return {
+      safe: false,
+      score: 0,
+      reasons: ["Creator BLACKLISTED"],
+      creator: derived.creator,
+      details: {
+        mint: mintStr,
+        resolver: canon?.resolver || null,
+        derived,
+        tokenProgram: prog,
+      },
+    };
+  }
+
+  // 6) Analyze creator wallet (on-chain)
+  const dev = await analyzeCreatorWallet(derived.creator);
+  score = Math.min(score, dev.score);
+  reasons.push(...dev.reasons);
+
+  if (score < AUTO_BLACKLIST_THRESHOLD) {
+    blacklist.add(derived.creator);
+    saveBlacklist(blacklist);
+    reasons.push("Creator auto-blacklisted");
+  }
+
+  return {
+    safe: score >= MIN_CREATOR_SCORE && dev.safe,
+    score,
+    reasons,
+    creator: derived.creator,
+    details: {
+      mint: mintStr,
+      resolver: canon?.resolver || null,
+      derived,
+      tokenProgram: prog,
+      dev: dev.details,
+    },
+  };
+}
