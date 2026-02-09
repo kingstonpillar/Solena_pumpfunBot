@@ -1,0 +1,12 @@
+[
+  {
+    "mint": "DALddkQK6BWC3fLNbtY3chzWGVTzABYwzkHrvAuupump",
+    "bondingCurve": "11111111111111111111111111111111",
+    "solLiquidity": 50.0,
+    "curveTargetSol": 85,
+    "curvePct": 58.82,
+    "firstSeenAt": "2026-02-09T00:00:00.000Z",
+    "firstSeenSlot": 0,
+    "rule": "manual_test"
+  }
+]
