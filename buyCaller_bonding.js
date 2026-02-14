@@ -114,7 +114,7 @@ function rpcLimited(opName, fn) {
 // ---------------- CONFIG ----------------
 const MAX_ENTRY = process.env.MAX_ENTRY ? parseInt(process.env.MAX_ENTRY) : 10;  // Maximum number of active positions allowed (tokens being held)
 const MAX_BUYS = process.env.MAX_BUYS ? parseInt(process.env.MAX_BUYS) : 20;  // Keep only the latest 20 buys in processed_mints.json
-const MAX_AGE = process.env.MAX_AGE ? parseInt(process.env.MAX_AGE) : 12 * 60 * 1000;  // 12 minutes
+const MAX_AGE = process.env.MAX_AGE ? parseInt(process.env.MAX_AGE) : 60 * 60 * 1000;  // 60 minutes
 const PROCESSED_MINTS_FILE = path.resolve(process.env.PROCESSED_MINTS_FILE || './processed_mints.json');
 const ACTIVE_POSITIONS_FILE = path.resolve(process.env.ACTIVE_POSITIONS_FILE || './active_positions.json');
 const BONDING_CANDIDATES_FILE = path.resolve(process.env.BONDING_CANDIDATES_FILE || './bonding_candidates.json');
@@ -266,12 +266,18 @@ async function getMintProgramOwner(mint) {
 // ---------------- MAIN LOGIC ----------------
 
 async function runBuyCallerOnce() {
+  // Log before starting the process
+  console.log('Starting to process candidates...');
+
   let processedList = loadProcessedList();  // Load the list of tokens already bought
   const processedSet = new Set(processedList); // Using a Set for fast lookup
   const allCandidates = loadCandidates();  // Load the list of candidate tokens for purchase
 
-  const candidates = pruneExpiredCandidates(allCandidates); // Filter out expired candidates based on MAX_AGE
+  // Log after loading candidates
+  console.log(`Loaded ${allCandidates.length} candidates.`);
 
+  // Process the candidates (you can put additional logging inside this processing loop if needed)
+  const candidates = pruneExpiredCandidates(allCandidates);  // Prune expired candidates based on MAX_AGE
   candidates.sort((a, b) => {
     const ta = Date.parse(a?.firstSeenAt || a?.detectedAt || '') || 0;
     const tb = Date.parse(b?.firstSeenAt || b?.detectedAt || '') || 0;
