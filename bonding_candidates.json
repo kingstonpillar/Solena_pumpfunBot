@@ -1,0 +1,32 @@
+[
+  {
+    "mint": "HkmwJUU8zwyBSiktJ9udeHAG6YmpmdxC6NB3DpWNpump",
+    "bondingCurve": "11111111111111111111111111111111",
+    "solLiquidity": 50.0,
+    "curveTargetSol": 85,
+    "curvePct": 58.82,
+    "firstSeenSlot": 0,
+    "rule": "manual_test",
+    "seenAt": "2026-02-16T15:50:00.000Z"
+  },
+  {
+    "mint": "ExampleMintAddressHere",
+    "bondingCurve": "DerivedBondingCurvePDAHere",
+    "solLiquidity": 52.438721,
+    "curveTargetSol": 85,
+    "curvePct": 61.69,
+    "seenAt": "2026-02-16T16:12:34.567Z",
+    "firstSeenSlot": 401234567,
+    "rule": "curve_pct>=50"
+  },
+  {
+    "mint": "HqbqHzaf1NuPno2ya2z28zV9Kksjpe5grAreEfhpump",
+    "bondingCurve": "11111111111111111111111111111111",
+    "solLiquidity": 42.0,
+    "curveTargetSol": 85,
+    "curvePct": 49.41,
+    "firstSeenSlot": 0,
+    "rule": "manual_test_token22",
+    "seenAt": "2026-02-16T15:50:00.000Z"
+  }
+]
