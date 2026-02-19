@@ -1,0 +1,16 @@
+[
+  {
+    "mintAddress": "F5tfztTnE4sYsMhZT5KrFpWvHmYSfJZoRjCuxKPbpump",
+    "mint": "F5tfztTnE4sYsMhZT5KrFpWvHmYSfJZoRjCuxKPb",
+    "entryPrice": 0.0000010,
+    "timestamp": "2026-02-19T18:00:00.000Z",
+    "migration": null
+  },
+  {
+    "mintAddress": "Aw3fg8qfQGCWTU7J79AfzVJAZUV42ZUrLdikpV1apump",
+    "mint": "Aw3fg8qfQGCWTU7J79AfzVJAZUV42ZUrLdikpV1a",
+    "entryPrice": 0.0000040,
+    "timestamp": "2026-02-19T18:00:00.000Z",
+    "migration": null
+  }
+]
