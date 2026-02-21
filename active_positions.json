@@ -1,0 +1,20 @@
+cat << 'EOF' > active_positions.json
+[
+  {
+    "mint": "F5tfztTnE4sYsMhZT5KrFpWvHmYSfJZoRjCuxKPbpump",
+    "buyPriceSOL": 0.0000010,
+    "inputSol": 0.1,
+    "bondingCurve": null,
+    "openedAt": "2026-02-19T18:00:00.000Z",
+    "migration": null
+  },
+  {
+    "mint": "BmCpgLyNz817F7x8WnEYGMXJHYKdr7dCtP1hR83ypump",
+    "buyPriceSOL": 0.0000040,
+    "inputSol": 0.1,
+    "bondingCurve": null,
+    "openedAt": "2026-02-19T18:00:00.000Z",
+    "migration": null
+  }
+]
+EOF
