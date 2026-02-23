@@ -1,0 +1,10 @@
+[
+  {
+    "mint": "5fb2uDqWNxyxno8PoeaBANWawCtbuwwEvtWkbQTrpump",
+    "buyPrice": 0,
+    "buyPriceSOL": 0,         // Add this line
+    "amount": "100%",
+    "status": "ACTIVE",
+    "createdAt": 1739999999999
+  }
+]
