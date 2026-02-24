@@ -1,0 +1,424 @@
+// autoSell_pumpfun.js (ESM)
+// Raydium and Orca sell executor with fallback:
+// - RPC failover (RPC_URL_5 -> RPC_URL_6)
+// - PQueue rate limiting
+// - Wallet decrypt
+// - SOL + token balance check (Token-2022 aware)
+// - If token balance is 0: returns NO_TOKEN_FUND + broadcasts proof tx (0-lamport self transfer)
+// - Telegram alert on NO_TOKEN_FUND and on confirmed sell
+
+import fs from "fs";
+import crypto from "crypto";
+import bs58 from "bs58";
+import dotenv from "dotenv";
+import fetch from "node-fetch";
+import PQueue from "p-queue";
+import {
+  Connection,
+  Keypair,
+  VersionedTransaction,
+  PublicKey,
+  SystemProgram,
+} from "@solana/web3.js";
+import { getAssociatedTokenAddress } from "@solana/spl-token";
+dotenv.config();
+
+// ---------------- RPC FAILOVER + PQUEUE ----------------
+const RPC_URL_5 = process.env.RPC_URL_5 || "";
+const RPC_URL_6 = process.env.RPC_URL_6 || "";
+const COMMITMENT = process.env.COMMITMENT || "confirmed";
+
+const RPC_CANDIDATES = [...new Set([RPC_URL_5, RPC_URL_6].filter(Boolean))];
+if (RPC_CANDIDATES.length === 0) throw new Error("RPC_URL_5 or RPC_URL_6 is required");
+
+// Function to validate public key format
+function isValidBase58(str) {
+  try {
+    bs58.decode(str);  // Attempt to decode the public key
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
+// Function to validate and return the PublicKey object
+function validatePublicKey(input) {
+  const publicKeyString = input.trim();
+  if (!isValidBase58(publicKeyString)) {
+    throw new Error("Invalid public key format");
+  }
+  try {
+    return new PublicKey(publicKeyString);  // Create and return PublicKey
+  } catch (error) {
+    throw new Error("Invalid public key input");
+  }
+}
+
+function isRetryableRpcError(e) {
+  const msg = String(e?.message || e || "").toLowerCase();
+  const code = e?.code;
+  return (
+    code === 429 ||
+    code === -32005 ||
+    msg.includes("429") ||
+    msg.includes("rate limit") ||
+    msg.includes("too many requests") ||
+    msg.includes("timeout") ||
+    msg.includes("timed out") ||
+    msg.includes("fetch failed") ||
+    msg.includes("failed to fetch") ||
+    msg.includes("econnreset") ||
+    msg.includes("socket hang up") ||
+    msg.includes("gateway") ||
+    msg.includes("service unavailable") ||
+    msg.includes("node is behind") ||
+    msg.includes("block height exceeded")
+  );
+}
+
+async function withRpcFailover(opName, fn) {
+  let lastErr = null;
+  for (const url of RPC_CANDIDATES) {
+    const conn = new Connection(url, COMMITMENT);
+    try {
+      return await fn(conn, url);
+    } catch (e) {
+      lastErr = e;
+      if (!isRetryableRpcError(e)) break;
+    }
+  }
+  const msg = String(lastErr?.message || lastErr || "unknown_error");
+  throw new Error(`[RPC_FAILOVER] ${opName} failed. last=${msg}`);
+}
+
+const rpcQueue = new PQueue({
+  concurrency: Number(process.env.RPC_CONCURRENCY || 4),
+  intervalCap: Number(process.env.RPC_INTERVAL_CAP || 8),
+  interval: Number(process.env.RPC_INTERVAL_MS || 1000),
+  carryoverConcurrencyCount: true,
+});
+
+function rpcLimited(opName, fn) {
+  return rpcQueue.add(() => withRpcFailover(opName, fn));
+}
+
+// ---------------- Raydium Quote ----------------
+async function getRaydiumQuote(inputMint, outputMint, amountRaw, slippageBps) {
+  const url = `https://api.raydium.io/swap/quote`;  // Raydium API endpoint
+
+  const body = {
+    inputMint,
+    outputMint,
+    amountRaw,
+    slippageBps,
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const data = await response.json();
+  if (!data.success) throw new Error('Error fetching Raydium quote');
+  return data;
+}
+
+// ---------------- Orca Quote ----------------
+async function getOrcaQuote(inputMint, outputMint, amountRaw, slippageBps) {
+  const url = `https://api.orca.so/swap/quote`;  // Orca API endpoint
+
+  const body = {
+    inputMint,
+    outputMint,
+    amountRaw,
+    slippageBps,
+  };
+
+  const response = await fetch(url, {
+    method: 'POST',
+    body: JSON.stringify(body),
+    headers: { 'Content-Type': 'application/json' },
+  });
+
+  const data = await response.json();
+  if (!data.success) throw new Error('Error fetching Orca quote');
+  return data;
+}
+
+// ---------------- Fallback Logic ----------------
+async function getBestQuote(inputMint, outputMint, amountRaw, slippageBps) {
+  try {
+    // Try Raydium first
+    const raydiumQuote = await getRaydiumQuote(inputMint, outputMint, amountRaw, slippageBps);
+    return raydiumQuote;
+  } catch (err) {
+    console.log("Raydium failed, falling back to Orca:", err.message);
+    try {
+      // Fallback to Orca if Raydium fails
+      const orcaQuote = await getOrcaQuote(inputMint, outputMint, amountRaw, slippageBps);
+      return orcaQuote;
+    } catch (err) {
+      throw new Error(`Both Raydium and Orca failed: ${err.message}`);
+    }
+  }
+}
+
+// ---------------- CONFIG ----------------
+const WSOL_MINT = process.env.WSOL_MINT?.trim() || "So11111111111111111111111111111111111111112";
+const DRY_RUN = String(process.env.DRY_RUN || "true").toLowerCase() === "true";
+const DEFAULT_SLIPPAGE_PCT = Number(process.env.SELL_SLIPPAGE_PCT || 10);
+const DEFAULT_PRIORITY_FEE = Number(process.env.SELL_PRIORITY_FEE || 0.00001);
+
+// ---- Telegram ----
+const TELEGRAM_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
+const TELEGRAM_CHAT_ID = process.env.TELEGRAM_CHAT_ID;
+
+async function sendTelegram(message) {
+  if (!TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) return;
+  try {
+    await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ chat_id: TELEGRAM_CHAT_ID, text: message }),
+    });
+  } catch {}
+}
+
+// ---------------- HELPERS ----------------
+function resolveMintStrict(input) {
+  const raw = String(input || "").trim();
+  if (!raw) throw new Error("mint missing");
+  return new PublicKey(raw).toBase58();
+}
+
+// ---------------- DECRYPTION AND WALLET LOADING ----------------
+function decryptPrivateKey(ciphertext, passphrase) {
+  const key = crypto.createHash("sha256").update(passphrase).digest();
+  const iv = Buffer.alloc(16, 0);
+  const decipher = crypto.createDecipheriv("aes-256-cbc", key, iv);
+
+  let decrypted = decipher.update(ciphertext, "base64", "utf8");
+  decrypted += decipher.final("utf8");
+  return decrypted;
+}
+
+function getWallet() {
+  const encrypted = process.env.ENCRYPTED_KEY;
+  if (!encrypted) throw new Error("ENCRYPTED_KEY missing in env");
+
+  const passphrasePath = process.env.KEY_PASSPHRASE_FILE || "/root/.wallet_pass";
+  if (!fs.existsSync(passphrasePath)) throw new Error("Passphrase file missing: " + passphrasePath);
+
+  const passphrase = fs.readFileSync(passphrasePath, "utf8").trim();
+  const decrypted = decryptPrivateKey(encrypted, passphrase);
+  const secret = bs58.decode(decrypted);
+  return Keypair.fromSecretKey(secret);
+}
+
+function lamportsFromSol(sol) {
+  const n = Number(sol);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.floor(n * 1e9);
+}
+
+function pctToBps(slippagePct) {
+  const pct = Number(slippagePct);
+  if (!Number.isFinite(pct) || pct <= 0) return 50;
+  return Math.max(1, Math.floor(pct * 100));
+}
+
+// ---------------- TOKEN BALANCE ----------------
+async function getTokenBalanceAnyProgram(conn, ownerPubkey, mintPubkey) {
+  const mintStr = mintPubkey.toBase58();
+  // Check Token-2022 and SPL token balances
+  const t22 = await conn.getParsedTokenAccountsByOwner(ownerPubkey, { programId: TOKEN_2022_PROGRAM_ID });
+  for (const v of t22.value) {
+    const info = v.account.data.parsed.info;
+    if (info.mint === mintStr) {
+      const ta = info.tokenAmount;
+      return {
+        program: "token2022",
+        ata: v.pubkey.toBase58(),
+        rawAmount: String(ta.amount || "0"),
+        uiAmountString: String(ta.uiAmountString ?? ta.uiAmount ?? "0"),
+        decimals: Number(ta.decimals),
+      };
+    }
+  }
+  const spl = await conn.getParsedTokenAccountsByOwner(ownerPubkey, { programId: TOKEN_PROGRAM_ID });
+  for (const v of spl.value) {
+    const info = v.account.data.parsed.info;
+    if (info.mint === mintStr) {
+      const ta = info.tokenAmount;
+      return {
+        program: "spl",
+        ata: v.pubkey.toBase58(),
+        rawAmount: String(ta.amount || "0"),
+        uiAmountString: String(ta.uiAmountString ?? ta.uiAmount ?? "0"),
+        decimals: Number(ta.decimals),
+      };
+    }
+  }
+  return null;
+}
+
+async function getSolBalance(ownerPubkey) {
+  const lamports = await rpcLimited("getBalance", (c) => c.getBalance(ownerPubkey));
+  return { lamports, sol: lamports / 1e9 };
+}
+
+// ---------------- PUBLIC API ----------------
+export async function executeAutoSellPumpfun({
+  mint,
+  amount = "100%",
+  slippagePct = DEFAULT_SLIPPAGE_PCT,
+  priorityFee = DEFAULT_PRIORITY_FEE,
+} = {}) {
+  const m = resolveMintStrict(mint);
+  const mintPk = new PublicKey(m);
+
+  const wallet = getWallet();
+  const publicKey = wallet.publicKey.toBase58();
+
+  const solBal = await getSolBalance(wallet.publicKey);
+
+  const tokenBal = await rpcLimited("getTokenBalanceAnyProgram", async (conn) => {
+    return await getTokenBalanceAnyProgram(conn, wallet.publicKey, mintPk);
+  });
+
+  const tokenUiNum = tokenBal ? Number(tokenBal.uiAmountString || "0") : 0;
+  const tokenRawBig = tokenBal ? BigInt(tokenBal.rawAmount || "0") : 0n;
+
+  // ---------------- NO TOKEN ----------------
+  if (!tokenBal || tokenRawBig <= 0n || tokenUiNum <= 0) {
+    const proof = await broadcastProofTx(wallet).catch((e) => ({
+      ok: false,
+      error: String(e?.message || e),
+    }));
+
+    await sendTelegram(
+      `NO_TOKEN_FUND\nmint: ${m}\nwallet: ${publicKey}\nsol: ${solBal.sol}\nprogram: ${tokenBal?.program || "none"}\nata: ${tokenBal?.ata || "none"}\ntokenUi: ${tokenBal?.uiAmountString || "0"}\ntokenRaw: ${tokenBal?.rawAmount || "0"}\nproofOk: ${proof.ok}\nproofSig: ${proof.signature || "null"}`
+    );
+
+    return {
+      ok: false,
+      reason: "NO_TOKEN_FUND",
+      mint: m,
+      wallet: publicKey,
+      solBalance: solBal.sol,
+      tokenProgram: tokenBal?.program || null,
+      tokenAta: tokenBal?.ata || null,
+      tokenUiBalance: tokenBal?.uiAmountString ? Number(tokenBal.uiAmountString) : 0,
+      tokenRawBalance: tokenBal?.rawAmount || "0",
+      broadcastProof: proof,
+    };
+  }
+
+  // ---------------- AMOUNT ----------------
+  const sellRaw = resolveSellRawAmount(amount, tokenBal);
+
+  if (sellRaw <= 0n) {
+    return {
+      ok: false,
+      reason: "INVALID_AMOUNT",
+      mint: m,
+      wallet: publicKey,
+      tokenProgram: tokenBal.program,
+      tokenAta: tokenBal.ata,
+      tokenUiBalance: Number(tokenBal.uiAmountString || "0"),
+      tokenRawBalance: tokenBal.rawAmount,
+      note: `Could not resolve sell amount from: ${String(amount)}`,
+    };
+  }
+
+  const slippageBps = pctToBps(slippagePct);
+  const prioLamports = lamportsFromSol(priorityFee);
+
+  // ---------------- DRY RUN ----------------
+  if (DRY_RUN) {
+    await sendTelegram(
+      `DRY_RUN sell skipped (Raydium/Orca Fallback)\nmint: ${m}\namount: ${String(amount)}\nraw: ${sellRaw}\nwallet: ${publicKey}\nsol: ${solBal.sol}\nprogram: ${tokenBal.program}\nata: ${tokenBal.ata}\npreTokenUi: ${tokenBal.uiAmountString}\nslippageBps: ${slippageBps}\nprioLamports: ${prioLamports}`
+    );
+
+    return {
+      ok: true,
+      dryRun: true,
+      wallet: publicKey,
+      solBalance: solBal.sol,
+      tokenProgram: tokenBal.program,
+      tokenAta: tokenBal.ata,
+      preTokenUiBalance: Number(tokenBal.uiAmountString || "0"),
+      preTokenRawBalance: tokenBal.rawAmount,
+      quoteParams: {
+        inputMint: m,
+        outputMint: WSOL_MINT,
+        amount: String(sellRaw),
+        slippageBps,
+        swapMode: "ExactIn",
+      },
+      swapParams: {
+        dynamicComputeUnitLimit: true,
+        prioritizationFeeLamports: prioLamports,
+      },
+    };
+  }
+
+  // ---------------- BEST QUOTE (Raydium / Orca) ----------------
+  const quote = await getBestQuote(
+    m,
+    WSOL_MINT,
+    sellRaw.toString(),
+    slippageBps
+  );
+
+  // ---------------- BUILD TX ----------------
+  const swapResp = await executeRaydiumSwap({
+    quoteResponse: quote,
+    userPublicKey: publicKey,
+    prioritizationFeeLamports: prioLamports,
+  });
+
+  if (!swapResp?.swapTransaction) {
+    await sendTelegram(
+      `SELL build failed (Raydium/Orca Fallback)\nmint: ${m}\nwallet: ${publicKey}\nraw: ${sellRaw}\nslippageBps: ${slippageBps}\nprioLamports: ${prioLamports}\nresp: ${JSON.stringify(swapResp).slice(0, 1200)}`
+    );
+    throw new Error("Raydium/Orca /swap did not return swapTransaction");
+  }
+
+  // ---------------- SIGN + SEND ----------------
+  const txBuf = Buffer.from(swapResp.swapTransaction, "base64");
+  const vtx = VersionedTransaction.deserialize(txBuf);
+  vtx.sign([wallet]);
+
+  const sig = await rpcLimited("sendRawTransaction(ray/orca)", (c) =>
+    c.sendRawTransaction(Buffer.from(vtx.serialize()), { skipPreflight: false })
+  );
+
+  await rpcLimited("confirmTransaction(ray/orca)", (c) => c.confirmTransaction(sig, COMMITMENT));
+
+  await sendTelegram(
+    `SELL CONFIRMED (Raydium/Orca)\nmint: ${m}\nwallet: ${publicKey}\nprogram: ${tokenBal.program}\nata: ${tokenBal.ata}\nrawBal: ${tokenBal.rawAmount}\nsellRaw: ${sellRaw.toString()}\nuiBal: ${tokenBal.uiAmountString}\namount: ${String(amount)}\nslippageBps: ${slippageBps}\nprioLamports: ${prioLamports}\nsol: ${solBal.sol}\nsig: ${sig}`
+  );
+
+  return {
+    ok: true,
+    dryRun: false,
+    signature: sig,
+    mint: m,
+    soldAmount: String(amount),
+    soldRawAmount: sellRaw.toString(),
+    slippageBps,
+    prioritizationFeeLamports: prioLamports,
+    wallet: publicKey,
+    solBalance: solBal.sol,
+    tokenProgram: tokenBal.program,
+    tokenAta: tokenBal.ata,
+    preTokenUiBalance: Number(tokenBal.uiAmountString || "0"),
+    preTokenRawBalance: tokenBal.rawAmount,
+    raydiumOrca: {
+      quoteOutAmount: quote?.outAmount,
+      priceImpactPct: quote?.priceImpactPct,
+    },
+  };
+}
