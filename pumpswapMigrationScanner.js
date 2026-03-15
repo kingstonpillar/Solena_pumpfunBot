@@ -2,6 +2,7 @@
 import { Connection, PublicKey } from "@solana/web3.js";
 import fetch from "node-fetch";
 import dotenv from "dotenv";
+import { withRpcLimit } from "./rpcLimiter.js";
 
 dotenv.config();
 
@@ -38,18 +39,21 @@ export async function* newMigrationToken(telegram = {}, pollInterval = 1000) {
     try {
       const now = Date.now();
 
-      const signatures = await connection.getSignaturesForAddress(
-        PUMPSWAP_MIGRATION_PROGRAM_ID,
-        { limit: 20 }
+      // Fetch signatures via RPC limiter
+      const signatures = await withRpcLimit(() =>
+        connection.getSignaturesForAddress(PUMPSWAP_MIGRATION_PROGRAM_ID, { limit: 20 })
       );
 
       for (const sigInfo of signatures.reverse()) {
         const txTime = sigInfo.blockTime ? sigInfo.blockTime * 1000 : now;
-        if (now - txTime > 30 * 1000) continue;
+        if (now - txTime > 30 * 1000) continue; // skip old signatures
 
-        if (lastSignatures[sigInfo.signature]) continue;
+        if (lastSignatures[sigInfo.signature]) continue; // skip duplicates
 
-        const tx = await connection.getTransaction(sigInfo.signature, { commitment: "confirmed" });
+        // Fetch transaction via RPC limiter
+        const tx = await withRpcLimit(() =>
+          connection.getTransaction(sigInfo.signature, { commitment: "confirmed" })
+        );
         if (!tx) continue;
 
         const instructions = tx.transaction.message.instructions;
@@ -60,7 +64,7 @@ export async function* newMigrationToken(telegram = {}, pollInterval = 1000) {
             console.log("[MIGRATION_DETECTED]", mint.toBase58(), sigInfo.signature);
 
             if (telegram?.botToken && telegram?.chatId) {
-              const message = `🚨 PumpSwap migration detected: ${mint.toBase58()}\nSignature: ${sigInfo.signature}`;
+              const message = ` PumpSwap migration detected: ${mint.toBase58()}\nSignature: ${sigInfo.signature}`;
               await sendTelegramAlert(message, telegram.botToken, telegram.chatId);
             }
 
@@ -72,10 +76,10 @@ export async function* newMigrationToken(telegram = {}, pollInterval = 1000) {
         }
       }
 
-      await new Promise(r => setTimeout(r, pollInterval));
+      await new Promise((r) => setTimeout(r, pollInterval));
     } catch (err) {
       console.error("[POLLING_ERROR]", err);
-      await new Promise(r => setTimeout(r, pollInterval * 2));
+      await new Promise((r) => setTimeout(r, pollInterval * 2));
     }
   }
 }
