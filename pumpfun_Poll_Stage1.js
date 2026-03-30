@@ -143,9 +143,6 @@ const STARTUP_BACKSCAN_SLOTS = Number(process.env.STARTUP_BACKSCAN_SLOTS || 200)
 const outPath = path.resolve(process.cwd(), OUT_FILE);
 
 // ---------------- In-memory state ----------------
-const CURVE_WATCH = new Map(); // mint -> watch record
-
-
 let detectorTimer = null;
 let detectorTickRunning = false;
 let detectorStopRequested = false;
